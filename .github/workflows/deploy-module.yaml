@@ -16,25 +16,30 @@ env:
   ACR_LOGIN_SERVER: msftlabsbicepmods.azurecr.io
   MODULE_PATH: bicep/modules
   SUBSCRIPTION_ID: b18ea7d6-14b5-41f3-a00d-804a5180c589
+  RESOURCE_GROUP: rg-bicep-module-tests
+  LOCATION: centralus
 
 permissions:
   contents: write
 
 jobs:
-  validate:
-    name: Validate Before Publish
+  # ──────────────────────────────────────────────
+  # Stage 1: What-If — preview deployment changes
+  # ──────────────────────────────────────────────
+  what-if:
+    name: What-If Preview
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.tag_info.outputs.version }}
       module_name: ${{ steps.tag_info.outputs.module }}
       description: ${{ steps.tag_info.outputs.description }}
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      
+
       - name: Read tag.yaml
         id: tag_info
         run: |
@@ -45,7 +50,7 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "description=$DESCRIPTION" >> $GITHUB_OUTPUT
           echo "Module: $MODULE | Version: $VERSION"
-      
+
       - name: Validate Version Format
         run: |
           VERSION="${{ steps.tag_info.outputs.version }}"
@@ -55,11 +60,71 @@ jobs:
             exit 1
           fi
           echo "Version format valid: $VERSION"
-      
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}'
+
+      - name: Bicep Build
+        run: |
+          echo "Building Bicep module..."
+          az bicep build --file main.bicep
+
+          if [ ! -f main.json ]; then
+            echo "Build failed: main.json not generated"
+            exit 1
+          fi
+          echo "Bicep build successful"
+
+      - name: Deployment What-If
+        run: |
+          echo "Running what-if deployment preview..."
+          az deployment group what-if \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --template-file main.bicep \
+            --parameters @tests/test.parameters.json \
+            --no-pretty-print
+
+          echo "What-if preview completed successfully"
+
+  # ──────────────────────────────────────────────
+  # Stage 2: Validate — ARM preflight validation
+  # ──────────────────────────────────────────────
+  validate:
+    name: Validate Deployment
+    runs-on: ubuntu-latest
+    needs: what-if
+    outputs:
+      version: ${{ needs.what-if.outputs.version }}
+      module_name: ${{ needs.what-if.outputs.module_name }}
+      description: ${{ needs.what-if.outputs.description }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}'
+
+      - name: Deployment Validate
+        run: |
+          echo "Running ARM preflight validation..."
+          az deployment group validate \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --template-file main.bicep \
+            --parameters @tests/test.parameters.json
+
+          echo "Preflight validation passed"
+
       - name: Check if Git Tag Exists
         id: check_tag
         run: |
-          VERSION="v${{ steps.tag_info.outputs.version }}"
+          VERSION="v${{ needs.what-if.outputs.version }}"
           if git rev-parse "$VERSION" >/dev/null 2>&1; then
             echo "tag_exists=true" >> $GITHUB_OUTPUT
             echo "Git tag $VERSION already exists"
@@ -67,35 +132,18 @@ jobs:
             echo "tag_exists=false" >> $GITHUB_OUTPUT
             echo "Git tag $VERSION is new"
           fi
-      
-      - name: Azure Login
-        uses: azure/login@v2
-        with:
-          creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}'
-      
-      - name: Validate Bicep Module
-        run: |
-          echo "Validating Bicep syntax..."
-          az bicep build --file main.bicep
-          
-          if [ ! -f main.json ]; then
-            echo "Build failed: main.json not generated"
-            exit 1
-          fi
-          
-          echo "Bicep validation successful"
-      
+
       - name: Check if Version Exists in ACR
         id: check_version
         run: |
-          VERSION="${{ steps.tag_info.outputs.version }}"
-          MODULE="${{ steps.tag_info.outputs.module }}"
-          
+          VERSION="${{ needs.what-if.outputs.version }}"
+          MODULE="${{ needs.what-if.outputs.module_name }}"
+
           TAGS=$(az acr repository show-tags \
             --name ${{ env.ACR_NAME }} \
             --repository ${{ env.MODULE_PATH }}/${MODULE} \
             --output tsv 2>/dev/null || echo "")
-          
+
           if echo "$TAGS" | grep -q "^${VERSION}$"; then
             echo "version_exists=true" >> $GITHUB_OUTPUT
             echo "Version $VERSION already exists in ACR"
@@ -103,30 +151,33 @@ jobs:
             echo "version_exists=false" >> $GITHUB_OUTPUT
             echo "Version $VERSION is new"
           fi
-      
+
       - name: Validate Version Uniqueness
         if: steps.check_version.outputs.version_exists == 'true' && github.event.inputs.force_publish != 'true'
         run: |
-          echo "Version ${{ steps.tag_info.outputs.version }} already exists in ACR"
+          echo "Version ${{ needs.what-if.outputs.version }} already exists in ACR"
           echo "Use force_publish option or bump version in tag.yaml"
           exit 1
 
+  # ──────────────────────────────────────────────
+  # Stage 3: Tag & Publish — push to ACR
+  # ──────────────────────────────────────────────
   tag-and-publish:
     name: Tag & Publish to ACR
     runs-on: ubuntu-latest
     needs: validate
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      
+
       - name: Create Git Tag
         run: |
           VERSION="v${{ needs.validate.outputs.version }}"
           DESCRIPTION="${{ needs.validate.outputs.description }}"
-          
+
           if git rev-parse "$VERSION" >/dev/null 2>&1; then
             echo "Git tag $VERSION already exists — skipping tag creation"
           else
@@ -136,20 +187,20 @@ jobs:
             git push origin "$VERSION"
             echo "Created and pushed git tag: $VERSION"
           fi
-      
+
       - name: Azure Login
         uses: azure/login@v2
         with:
           creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}'
-      
+
       - name: Set Azure Subscription
         run: |
           az account set --subscription ${{ env.SUBSCRIPTION_ID }}
-      
+
       - name: Login to Azure Container Registry
         run: |
           az acr login --name ${{ env.ACR_NAME }}
-      
+
       - name: Publish Module to ACR (Versioned)
         run: |
           VERSION="${{ needs.validate.outputs.version }}"
