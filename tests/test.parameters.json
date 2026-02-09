@@ -1,0 +1,87 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "workloadName": {
+      "value": "testvm"
+    },
+    "location": {
+      "value": "centralus"
+    },
+    "environment": {
+      "value": "dev"
+    },
+    "osType": {
+      "value": "Linux"
+    },
+    "vmSize": {
+      "value": "Standard_B2ms"
+    },
+    "adminUsername": {
+      "value": "azureadmin"
+    },
+    "adminPassword": {
+      "value": "P@ssw0rdForT3st!"
+    },
+    "imageReference": {
+      "value": {
+        "publisher": "Canonical",
+        "offer": "0001-com-ubuntu-server-jammy",
+        "sku": "22_04-lts-gen2",
+        "version": "latest"
+      }
+    },
+    "osDisk": {
+      "value": {
+        "createOption": "FromImage",
+        "managedDisk": {
+          "storageAccountType": "Premium_LRS"
+        },
+        "caching": "ReadWrite",
+        "diskSizeGB": 128
+      }
+    },
+    "dataDisks": {
+      "value": [
+        {
+          "diskSizeGB": 64,
+          "lun": 0,
+          "createOption": "Empty",
+          "storageAccountType": "Premium_LRS",
+          "caching": "ReadOnly"
+        }
+      ]
+    },
+    "nicConfigs": {
+      "value": [
+        {
+          "subnetId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-network/providers/Microsoft.Network/virtualNetworks/vnet-main/subnets/snet-compute",
+          "enableAcceleratedNetworking": true,
+          "privateIPAllocationMethod": "Dynamic"
+        }
+      ]
+    },
+    "enablePublicIp": {
+      "value": false
+    },
+    "enableDiagnostics": {
+      "value": true
+    },
+    "enableLock": {
+      "value": true
+    },
+    "lockLevel": {
+      "value": "CanNotDelete"
+    },
+    "roleAssignments": {
+      "value": []
+    },
+    "tags": {
+      "value": {
+        "project": "test",
+        "environment": "dev",
+        "managedBy": "bicep"
+      }
+    }
+  }
+}

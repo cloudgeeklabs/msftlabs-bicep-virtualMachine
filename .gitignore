@@ -1,0 +1,15 @@
+# Build output
+*.json
+!bicepconfig.json
+!tests/test.parameters.json
+*.bicepparam.json
+.DS_Store
+Thumbs.db
+.vscode/
+.vs/
+*.log
+*.tmp
+temp/
+.azure/
+node_modules/
+*.user

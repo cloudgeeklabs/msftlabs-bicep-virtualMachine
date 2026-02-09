@@ -1,0 +1,27 @@
+# PSRule configuration for Azure best practices validation
+# See: https://aka.ms/ps-rule/options
+
+requires:
+  PSRule.Rules.Azure: '>=1.26.0'
+
+input:
+  pathIgnore:
+    - '*.md'
+    - '.github/**'
+    - '.gitignore'
+
+output:
+  culture:
+    - 'en-US'
+
+configuration:
+  Azure_AllowedRegions:
+    - 'centralus'
+    - 'eastus'
+    - 'eastus2'
+    - 'westus2'
+    - 'westus3'
+
+rule:
+  exclude:
+    - 'Azure.Resource.UseTags'

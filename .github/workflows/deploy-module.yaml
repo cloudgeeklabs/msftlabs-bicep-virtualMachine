@@ -1,0 +1,229 @@
+name: Deploy Module to ACR
+
+on:
+  push:
+    branches: [main]
+    paths: ['tag.yaml']
+  workflow_dispatch:
+    inputs:
+      force_publish:
+        description: 'Force publish even if version exists'
+        required: false
+        type: boolean
+
+env:
+  ACR_NAME: msftlabsbicepmods
+  ACR_LOGIN_SERVER: msftlabsbicepmods.azurecr.io
+  MODULE_PATH: bicep/modules
+  SUBSCRIPTION_ID: b18ea7d6-14b5-41f3-a00d-804a5180c589
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: Validate Before Publish
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tag_info.outputs.version }}
+      module_name: ${{ steps.tag_info.outputs.module }}
+      description: ${{ steps.tag_info.outputs.description }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Read tag.yaml
+        id: tag_info
+        run: |
+          MODULE=$(yq e '.module' tag.yaml)
+          VERSION=$(yq e '.version' tag.yaml)
+          DESCRIPTION=$(yq e '.description' tag.yaml)
+          echo "module=$MODULE" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "description=$DESCRIPTION" >> $GITHUB_OUTPUT
+          echo "Module: $MODULE | Version: $VERSION"
+      
+      - name: Validate Version Format
+        run: |
+          VERSION="${{ steps.tag_info.outputs.version }}"
+          if ! [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid version format: $VERSION"
+            echo "Version must follow semantic versioning (e.g., 1.0.0)"
+            exit 1
+          fi
+          echo "Version format valid: $VERSION"
+      
+      - name: Check if Git Tag Exists
+        id: check_tag
+        run: |
+          VERSION="v${{ steps.tag_info.outputs.version }}"
+          if git rev-parse "$VERSION" >/dev/null 2>&1; then
+            echo "tag_exists=true" >> $GITHUB_OUTPUT
+            echo "Git tag $VERSION already exists"
+          else
+            echo "tag_exists=false" >> $GITHUB_OUTPUT
+            echo "Git tag $VERSION is new"
+          fi
+      
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}'
+      
+      - name: Validate Bicep Module
+        run: |
+          echo "Validating Bicep syntax..."
+          az bicep build --file main.bicep
+          
+          if [ ! -f main.json ]; then
+            echo "Build failed: main.json not generated"
+            exit 1
+          fi
+          
+          echo "Bicep validation successful"
+      
+      - name: Check if Version Exists in ACR
+        id: check_version
+        run: |
+          VERSION="${{ steps.tag_info.outputs.version }}"
+          MODULE="${{ steps.tag_info.outputs.module }}"
+          
+          TAGS=$(az acr repository show-tags \
+            --name ${{ env.ACR_NAME }} \
+            --repository ${{ env.MODULE_PATH }}/${MODULE} \
+            --output tsv 2>/dev/null || echo "")
+          
+          if echo "$TAGS" | grep -q "^${VERSION}$"; then
+            echo "version_exists=true" >> $GITHUB_OUTPUT
+            echo "Version $VERSION already exists in ACR"
+          else
+            echo "version_exists=false" >> $GITHUB_OUTPUT
+            echo "Version $VERSION is new"
+          fi
+      
+      - name: Validate Version Uniqueness
+        if: steps.check_version.outputs.version_exists == 'true' && github.event.inputs.force_publish != 'true'
+        run: |
+          echo "Version ${{ steps.tag_info.outputs.version }} already exists in ACR"
+          echo "Use force_publish option or bump version in tag.yaml"
+          exit 1
+
+  tag-and-publish:
+    name: Tag & Publish to ACR
+    runs-on: ubuntu-latest
+    needs: validate
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Create Git Tag
+        run: |
+          VERSION="v${{ needs.validate.outputs.version }}"
+          DESCRIPTION="${{ needs.validate.outputs.description }}"
+          
+          if git rev-parse "$VERSION" >/dev/null 2>&1; then
+            echo "Git tag $VERSION already exists — skipping tag creation"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag -a "$VERSION" -m "$DESCRIPTION"
+            git push origin "$VERSION"
+            echo "Created and pushed git tag: $VERSION"
+          fi
+      
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}'
+      
+      - name: Set Azure Subscription
+        run: |
+          az account set --subscription ${{ env.SUBSCRIPTION_ID }}
+      
+      - name: Login to Azure Container Registry
+        run: |
+          az acr login --name ${{ env.ACR_NAME }}
+      
+      - name: Publish Module to ACR (Versioned)
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          MODULE="${{ needs.validate.outputs.module_name }}"
+          TARGET="br:${{ env.ACR_LOGIN_SERVER }}/${{ env.MODULE_PATH }}/${MODULE}:${VERSION}"
+          
+          echo "Publishing to: $TARGET"
+          
+          az bicep publish \
+            --file main.bicep \
+            --target "$TARGET" \
+            ${{ github.event.inputs.force_publish == 'true' && '--force' || '' }}
+          
+          echo "Successfully published version $VERSION"
+      
+      - name: Publish Latest Tag
+        run: |
+          MODULE="${{ needs.validate.outputs.module_name }}"
+          TARGET="br:${{ env.ACR_LOGIN_SERVER }}/${{ env.MODULE_PATH }}/${MODULE}:latest"
+          
+          echo "Publishing latest tag to: $TARGET"
+          
+          az bicep publish \
+            --file main.bicep \
+            --target "$TARGET" \
+            --force
+          
+          echo "Successfully published latest tag"
+      
+      - name: Verify Publication
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          MODULE="${{ needs.validate.outputs.module_name }}"
+          
+          echo "Verifying published module..."
+          
+          TAGS=$(az acr repository show-tags \
+            --name ${{ env.ACR_NAME }} \
+            --repository ${{ env.MODULE_PATH }}/${MODULE} \
+            --output table)
+          
+          echo "Available tags:"
+          echo "$TAGS"
+          
+          if echo "$TAGS" | grep -q "$VERSION"; then
+            echo "Version $VERSION successfully verified in ACR"
+          else
+            echo "Failed to verify version $VERSION in ACR"
+            exit 1
+          fi
+      
+      - name: Generate Deployment Summary
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          MODULE="${{ needs.validate.outputs.module_name }}"
+          MODULE_REF="br:${{ env.ACR_LOGIN_SERVER }}/${{ env.MODULE_PATH }}/${MODULE}:${VERSION}"
+          
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ### Module Published Successfully
+          
+          **Module:** ${MODULE}
+          **Version:** ${VERSION}
+          **Description:** ${{ needs.validate.outputs.description }}
+          **Registry:** ${{ env.ACR_LOGIN_SERVER }}
+          **Git Tag:** v${VERSION}
+          **Published:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          
+          **Module Reference:**
+          \`\`\`bicep
+          module ${MODULE} '${MODULE_REF}' = {
+            name: '${MODULE}Deployment'
+            params: {
+              // See README for required parameters
+            }
+          }
+          \`\`\`
+          EOF
